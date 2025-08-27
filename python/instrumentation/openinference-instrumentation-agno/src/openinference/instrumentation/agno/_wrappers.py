@@ -1,4 +1,5 @@
 import json
+import time
 from enum import Enum
 from inspect import signature
 from secrets import token_hex
@@ -466,6 +467,77 @@ def _parse_model_output(output: Any) -> str:
         return str(output)
 
 
+def _extract_token_usage(response: Any) -> Optional[Dict[str, Any]]:
+    """Extract token usage information from model response."""
+    try:
+        if hasattr(response, "usage"):
+            usage = response.usage
+            if hasattr(usage, "model_dump"):
+                return usage.model_dump()
+            elif isinstance(usage, dict):
+                return usage
+            else:
+                # Try to convert usage object to dict
+                usage_dict = {}
+                for attr in ["prompt_tokens", "completion_tokens", "total_tokens", "input_tokens", "output_tokens"]:
+                    if hasattr(usage, attr):
+                        usage_dict[attr] = getattr(usage, attr)
+                return usage_dict if usage_dict else None
+        
+        # Try to extract from response dict structure
+        if isinstance(response, dict) and "usage" in response:
+            return response["usage"]
+        
+        return None
+    except Exception:
+        return None
+
+
+def _calculate_time_per_output_token(duration_ms: float, output_tokens: Optional[int]) -> Optional[float]:
+    """Calculate average time per output token in milliseconds."""
+    if output_tokens and output_tokens > 0:
+        return duration_ms / output_tokens
+    return None
+
+
+class _StreamTimingCollector:
+    """Helper class to collect timing metrics for streaming operations."""
+    
+    def __init__(self):
+        self.start_time: Optional[float] = None
+        self.first_token_time: Optional[float] = None
+        self.token_times: list[float] = []
+        self.token_count: int = 0
+    
+    def start_operation(self):
+        """Mark the start of the streaming operation."""
+        self.start_time = time.perf_counter()
+    
+    def record_token(self):
+        """Record the receipt of a token."""
+        current_time = time.perf_counter()
+        
+        if self.first_token_time is None:
+            self.first_token_time = current_time
+        
+        self.token_times.append(current_time)
+        self.token_count += 1
+    
+    def get_time_to_first_token_ms(self) -> Optional[float]:
+        """Get time to first token in milliseconds."""
+        if self.start_time is not None and self.first_token_time is not None:
+            return (self.first_token_time - self.start_time) * 1000
+        return None
+    
+    def get_average_time_between_tokens_ms(self) -> Optional[float]:
+        """Get average time between tokens in milliseconds."""
+        if len(self.token_times) > 1:
+            total_time = self.token_times[-1] - self.token_times[0]
+            intervals = len(self.token_times) - 1
+            return (total_time / intervals) * 1000
+        return None
+
+
 class _ModelWrapper:
     def __init__(self, tracer: trace_api.Tracer) -> None:
         self._tracer = tracer
@@ -499,12 +571,39 @@ class _ModelWrapper:
             span.set_status(trace_api.StatusCode.OK)
             span.set_attribute(LLM_MODEL_NAME, model.id)
             span.set_attribute(LLM_PROVIDER, model.provider)
+            span.set_attribute(GEN_AI_CLIENT_OPERATION, "invoke")
 
-            response = wrapped(*args, **kwargs)
-            output_message = _parse_model_output(response)
+            # Record start time
+            start_time = time.perf_counter()
+            
+            try:
+                response = wrapped(*args, **kwargs)
+                output_message = _parse_model_output(response)
 
-            span.set_attributes(dict(_output_value_and_mime_type(output_message)))
-            return response
+                # Calculate operation duration
+                end_time = time.perf_counter()
+                duration_ms = (end_time - start_time) * 1000
+                span.set_attribute(GEN_AI_CLIENT_OPERATION_DURATION, duration_ms)
+
+                # Extract token usage
+                token_usage = _extract_token_usage(response)
+                if token_usage:
+                    span.set_attribute(GEN_AI_CLIENT_TOKEN_USAGE, safe_json_dumps(token_usage))
+                    
+                    # Calculate time per output token
+                    output_tokens = token_usage.get("completion_tokens") or token_usage.get("output_tokens")
+                    time_per_token = _calculate_time_per_output_token(duration_ms, output_tokens)
+                    if time_per_token is not None:
+                        span.set_attribute(GEN_AI_CLIENT_TIME_PER_OUTPUT_TOKEN, time_per_token)
+
+                span.set_attributes(dict(_output_value_and_mime_type(output_message)))
+                return response
+            except Exception as e:
+                # Still record duration even on error
+                end_time = time.perf_counter()
+                duration_ms = (end_time - start_time) * 1000
+                span.set_attribute(GEN_AI_CLIENT_OPERATION_DURATION, duration_ms)
+                raise
 
     def run_stream(
         self,
@@ -535,13 +634,55 @@ class _ModelWrapper:
             span.set_status(trace_api.StatusCode.OK)
             span.set_attribute(LLM_MODEL_NAME, model.id)
             span.set_attribute(LLM_PROVIDER, model.provider)
+            span.set_attribute(GEN_AI_CLIENT_OPERATION, "invoke_stream")
+
+            # Set up timing collection
+            timing_collector = _StreamTimingCollector()
+            timing_collector.start_operation()
+            start_time = time.perf_counter()
 
             responses = []
-            for chunk in wrapped(*args, **kwargs):
-                responses.append(chunk)
-                yield chunk
-            output_message = json.dumps([_parse_model_output(response) for response in responses])
-            span.set_attributes(dict(_output_value_and_mime_type(output_message)))
+            try:
+                for chunk in wrapped(*args, **kwargs):
+                    timing_collector.record_token()
+                    responses.append(chunk)
+                    yield chunk
+                
+                # Calculate final metrics
+                end_time = time.perf_counter()
+                duration_ms = (end_time - start_time) * 1000
+                span.set_attribute(GEN_AI_CLIENT_OPERATION_DURATION, duration_ms)
+
+                # Set streaming-specific timing metrics
+                time_to_first_token = timing_collector.get_time_to_first_token_ms()
+                if time_to_first_token is not None:
+                    span.set_attribute(GEN_AI_CLIENT_TIME_TO_FIRST_TOKEN, time_to_first_token)
+
+                time_between_tokens = timing_collector.get_average_time_between_tokens_ms()
+                if time_between_tokens is not None:
+                    span.set_attribute(GEN_AI_CLIENT_TIME_BETWEEN_TOKEN, time_between_tokens)
+
+                # Try to extract token usage from the final response or model
+                if responses:
+                    last_response = responses[-1]
+                    token_usage = _extract_token_usage(last_response)
+                    if token_usage:
+                        span.set_attribute(GEN_AI_CLIENT_TOKEN_USAGE, safe_json_dumps(token_usage))
+                        
+                        # Calculate time per output token
+                        output_tokens = token_usage.get("completion_tokens") or token_usage.get("output_tokens") or timing_collector.token_count
+                        time_per_token = _calculate_time_per_output_token(duration_ms, output_tokens)
+                        if time_per_token is not None:
+                            span.set_attribute(GEN_AI_CLIENT_TIME_PER_OUTPUT_TOKEN, time_per_token)
+
+                output_message = json.dumps([_parse_model_output(response) for response in responses])
+                span.set_attributes(dict(_output_value_and_mime_type(output_message)))
+            except Exception as e:
+                # Still record duration even on error
+                end_time = time.perf_counter()
+                duration_ms = (end_time - start_time) * 1000
+                span.set_attribute(GEN_AI_CLIENT_OPERATION_DURATION, duration_ms)
+                raise
 
     async def arun(
         self,
@@ -572,12 +713,39 @@ class _ModelWrapper:
             span.set_status(trace_api.StatusCode.OK)
             span.set_attribute(LLM_MODEL_NAME, model.id)
             span.set_attribute(LLM_PROVIDER, model.provider)
+            span.set_attribute(GEN_AI_CLIENT_OPERATION, "ainvoke")
 
-            response = await wrapped(*args, **kwargs)
-            output_message = _parse_model_output(response)
+            # Record start time
+            start_time = time.perf_counter()
+            
+            try:
+                response = await wrapped(*args, **kwargs)
+                output_message = _parse_model_output(response)
 
-            span.set_attributes(dict(_output_value_and_mime_type(output_message)))
-            return response
+                # Calculate operation duration
+                end_time = time.perf_counter()
+                duration_ms = (end_time - start_time) * 1000
+                span.set_attribute(GEN_AI_CLIENT_OPERATION_DURATION, duration_ms)
+
+                # Extract token usage
+                token_usage = _extract_token_usage(response)
+                if token_usage:
+                    span.set_attribute(GEN_AI_CLIENT_TOKEN_USAGE, safe_json_dumps(token_usage))
+                    
+                    # Calculate time per output token
+                    output_tokens = token_usage.get("completion_tokens") or token_usage.get("output_tokens")
+                    time_per_token = _calculate_time_per_output_token(duration_ms, output_tokens)
+                    if time_per_token is not None:
+                        span.set_attribute(GEN_AI_CLIENT_TIME_PER_OUTPUT_TOKEN, time_per_token)
+
+                span.set_attributes(dict(_output_value_and_mime_type(output_message)))
+                return response
+            except Exception as e:
+                # Still record duration even on error
+                end_time = time.perf_counter()
+                duration_ms = (end_time - start_time) * 1000
+                span.set_attribute(GEN_AI_CLIENT_OPERATION_DURATION, duration_ms)
+                raise
 
     async def arun_stream(
         self,
@@ -610,13 +778,55 @@ class _ModelWrapper:
             span.set_status(trace_api.StatusCode.OK)
             span.set_attribute(LLM_MODEL_NAME, model.id)
             span.set_attribute(LLM_PROVIDER, model.provider)
+            span.set_attribute(GEN_AI_CLIENT_OPERATION, "ainvoke_stream")
+
+            # Set up timing collection
+            timing_collector = _StreamTimingCollector()
+            timing_collector.start_operation()
+            start_time = time.perf_counter()
 
             responses = []
-            async for chunk in wrapped(*args, **kwargs):  # type: ignore[attr-defined]
-                responses.append(chunk)
-                yield chunk
-            output_message = json.dumps([_parse_model_output(response) for response in responses])
-            span.set_attributes(dict(_output_value_and_mime_type(output_message)))
+            try:
+                async for chunk in wrapped(*args, **kwargs):  # type: ignore[attr-defined]
+                    timing_collector.record_token()
+                    responses.append(chunk)
+                    yield chunk
+                
+                # Calculate final metrics
+                end_time = time.perf_counter()
+                duration_ms = (end_time - start_time) * 1000
+                span.set_attribute(GEN_AI_CLIENT_OPERATION_DURATION, duration_ms)
+
+                # Set streaming-specific timing metrics
+                time_to_first_token = timing_collector.get_time_to_first_token_ms()
+                if time_to_first_token is not None:
+                    span.set_attribute(GEN_AI_CLIENT_TIME_TO_FIRST_TOKEN, time_to_first_token)
+
+                time_between_tokens = timing_collector.get_average_time_between_tokens_ms()
+                if time_between_tokens is not None:
+                    span.set_attribute(GEN_AI_CLIENT_TIME_BETWEEN_TOKEN, time_between_tokens)
+
+                # Try to extract token usage from the final response or model
+                if responses:
+                    last_response = responses[-1]
+                    token_usage = _extract_token_usage(last_response)
+                    if token_usage:
+                        span.set_attribute(GEN_AI_CLIENT_TOKEN_USAGE, safe_json_dumps(token_usage))
+                        
+                        # Calculate time per output token
+                        output_tokens = token_usage.get("completion_tokens") or token_usage.get("output_tokens") or timing_collector.token_count
+                        time_per_token = _calculate_time_per_output_token(duration_ms, output_tokens)
+                        if time_per_token is not None:
+                            span.set_attribute(GEN_AI_CLIENT_TIME_PER_OUTPUT_TOKEN, time_per_token)
+
+                output_message = json.dumps([_parse_model_output(response) for response in responses])
+                span.set_attributes(dict(_output_value_and_mime_type(output_message)))
+            except Exception as e:
+                # Still record duration even on error
+                end_time = time.perf_counter()
+                duration_ms = (end_time - start_time) * 1000
+                span.set_attribute(GEN_AI_CLIENT_OPERATION_DURATION, duration_ms)
+                raise
 
 
 def _function_call_attributes(function_call: FunctionCall) -> Iterator[Tuple[str, Any]]:
@@ -759,6 +969,12 @@ LLM_TOKEN_COUNT_COMPLETION = SpanAttributes.LLM_TOKEN_COUNT_COMPLETION
 LLM_TOKEN_COUNT_PROMPT = SpanAttributes.LLM_TOKEN_COUNT_PROMPT
 LLM_TOKEN_COUNT_TOTAL = SpanAttributes.LLM_TOKEN_COUNT_TOTAL
 LLM_FUNCTION_CALL = SpanAttributes.LLM_FUNCTION_CALL
+GEN_AI_CLIENT_OPERATION = SpanAttributes.GEN_AI_CLIENT_OPERATION
+GEN_AI_CLIENT_OPERATION_DURATION = SpanAttributes.GEN_AI_CLIENT_OPERATION_DURATION
+GEN_AI_CLIENT_TIME_TO_FIRST_TOKEN = SpanAttributes.GEN_AI_CLIENT_TIME_TO_FIRST_TOKEN
+GEN_AI_CLIENT_TIME_BETWEEN_TOKEN = SpanAttributes.GEN_AI_CLIENT_TIME_BETWEEN_TOKEN
+GEN_AI_CLIENT_TIME_PER_OUTPUT_TOKEN = SpanAttributes.GEN_AI_CLIENT_TIME_PER_OUTPUT_TOKEN
+GEN_AI_CLIENT_TOKEN_USAGE = SpanAttributes.GEN_AI_CLIENT_TOKEN_USAGE
 OPENINFERENCE_SPAN_KIND = SpanAttributes.OPENINFERENCE_SPAN_KIND
 OUTPUT_MIME_TYPE = SpanAttributes.OUTPUT_MIME_TYPE
 OUTPUT_VALUE = SpanAttributes.OUTPUT_VALUE

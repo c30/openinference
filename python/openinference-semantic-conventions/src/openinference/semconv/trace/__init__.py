@@ -181,6 +181,31 @@ class SpanAttributes:
     List of tools that are advertised to the LLM to be able to call
     """
 
+    GEN_AI_CLIENT_OPERATION = "gen_ai.client.operation"
+    """
+    The name of the operation being performed by the GenAI client, such as 'invoke', 'invoke_stream', etc.
+    """
+    GEN_AI_CLIENT_OPERATION_DURATION = "gen_ai.client.operation.duration"
+    """
+    Total duration of the GenAI client operation in milliseconds.
+    """
+    GEN_AI_CLIENT_TIME_TO_FIRST_TOKEN = "gen_ai.client.time_to_first_token"
+    """
+    Time in milliseconds from the start of the operation to the first token received (for streaming operations).
+    """
+    GEN_AI_CLIENT_TIME_BETWEEN_TOKEN = "gen_ai.client.time_between_token"
+    """
+    Average time in milliseconds between consecutive tokens during streaming (for streaming operations).
+    """
+    GEN_AI_CLIENT_TIME_PER_OUTPUT_TOKEN = "gen_ai.client.time_per_output_token"
+    """
+    Average time in milliseconds per output token generated.
+    """
+    GEN_AI_CLIENT_TOKEN_USAGE = "gen_ai.client.token.usage"
+    """
+    Token usage information from the GenAI client response, represented as a JSON string.
+    """
+
     TOOL_NAME = "tool.name"
     """
     Name of the tool being used.
