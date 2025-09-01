@@ -58,17 +58,59 @@ def test_agno_metrics_integration():
         else:
             print("✗ No histogram creation found in __init__.py")
             
+        # Check for specific histograms
+        expected_histograms = [
+            'gen_ai.client.operation.duration',
+            'gen_ai.client.time_to_first_token',
+            'gen_ai.client.time_per_output_token',
+            'gen_ai.client.time_between_tokens'
+        ]
+        
+        for histogram_name in expected_histograms:
+            if histogram_name in init_content:
+                print(f"✓ {histogram_name} histogram created")
+            else:
+                print(f"✗ {histogram_name} histogram not found")
+            
         # Check for histogram record calls in wrappers
         if 'histogram.record(' in wrappers_content:
             print("✓ Histogram recording found in _wrappers.py")
         else:
             print("✗ No histogram recording found in _wrappers.py")
             
+        # Check for specific histogram record calls
+        histogram_record_checks = [
+            'duration_histogram.record(',
+            'time_to_first_token_histogram.record(',
+            'time_per_token_histogram.record(',
+            'time_between_tokens_histogram.record('
+        ]
+        
+        for record_call in histogram_record_checks:
+            if record_call in wrappers_content:
+                print(f"✓ {record_call.split('.')[0]} recording found")
+            else:
+                print(f"✗ {record_call.split('.')[0]} recording not found")
+            
         # Check for metrics parameter in ModelWrapper
         if 'metrics: Optional[Dict[str, Any]]' in wrappers_content:
             print("✓ Metrics parameter added to _ModelWrapper")
         else:
             print("✗ No metrics parameter in _ModelWrapper")
+            
+        # Check for different operation types
+        operation_types = [
+            '"operation": "invoke"',
+            '"operation": "ainvoke"', 
+            '"operation": "invoke_stream"',
+            '"operation": "ainvoke_stream"'
+        ]
+        
+        for operation in operation_types:
+            if operation in wrappers_content:
+                print(f"✓ {operation} operation found")
+            else:
+                print(f"✗ {operation} operation not found")
             
         return True
         
