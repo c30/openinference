@@ -479,21 +479,55 @@ def _extract_token_usage(response: Any) -> Optional[Dict[str, Any]]:
             else:
                 # Try to convert usage object to dict
                 usage_dict = {}
-                for attr in ["prompt_tokens", "completion_tokens", "total_tokens", "input_tokens", "output_tokens"]:
+                for attr in [
+                    "prompt_tokens",
+                    "completion_tokens",
+                    "total_tokens",
+                    "input_tokens",
+                    "output_tokens",
+                ]:
                     if hasattr(usage, attr):
                         usage_dict[attr] = getattr(usage, attr)
                 return usage_dict if usage_dict else None
-        
+
         # Try to extract from response dict structure
         if isinstance(response, dict) and "usage" in response:
             return response["usage"]
-        
+
         return None
     except Exception:
         return None
 
 
-def _calculate_time_per_output_token(duration_ms: float, output_tokens: Optional[int]) -> Optional[float]:
+def _get_llm_token_count_attributes(
+    token_usage: Optional[Dict[str, Any]]
+) -> Iterator[Tuple[str, Any]]:
+    """Extract individual token count attributes from usage data following semantic conventions."""
+    if not token_usage:
+        return
+
+    # Handle prompt tokens (input tokens)
+    prompt_tokens = token_usage.get("prompt_tokens") or token_usage.get("input_tokens")
+    if prompt_tokens is not None:
+        yield LLM_TOKEN_COUNT_PROMPT, prompt_tokens
+
+    # Handle completion tokens (output tokens)
+    completion_tokens = token_usage.get("completion_tokens") or token_usage.get("output_tokens")
+    if completion_tokens is not None:
+        yield LLM_TOKEN_COUNT_COMPLETION, completion_tokens
+
+    # Handle total tokens
+    total_tokens = token_usage.get("total_tokens")
+    if total_tokens is not None:
+        yield LLM_TOKEN_COUNT_TOTAL, total_tokens
+    elif prompt_tokens is not None and completion_tokens is not None:
+        # Calculate total if not provided but components are available
+        yield LLM_TOKEN_COUNT_TOTAL, prompt_tokens + completion_tokens
+
+
+def _calculate_time_per_output_token(
+    duration_ms: float, output_tokens: Optional[int]
+) -> Optional[float]:
     """Calculate average time per output token in milliseconds."""
     if output_tokens and output_tokens > 0:
         return duration_ms / output_tokens
@@ -502,33 +536,33 @@ def _calculate_time_per_output_token(duration_ms: float, output_tokens: Optional
 
 class _StreamTimingCollector:
     """Helper class to collect timing metrics for streaming operations."""
-    
+
     def __init__(self):
         self.start_time: Optional[float] = None
         self.first_token_time: Optional[float] = None
         self.token_times: list[float] = []
         self.token_count: int = 0
-    
+
     def start_operation(self):
         """Mark the start of the streaming operation."""
         self.start_time = time.perf_counter()
-    
+
     def record_token(self):
         """Record the receipt of a token."""
         current_time = time.perf_counter()
-        
+
         if self.first_token_time is None:
             self.first_token_time = current_time
-        
+
         self.token_times.append(current_time)
         self.token_count += 1
-    
+
     def get_time_to_first_token_ms(self) -> Optional[float]:
         """Get time to first token in milliseconds."""
         if self.start_time is not None and self.first_token_time is not None:
             return (self.first_token_time - self.start_time) * 1000
         return None
-    
+
     def get_average_time_between_tokens_ms(self) -> Optional[float]:
         """Get average time between tokens in milliseconds."""
         if len(self.token_times) > 1:
@@ -575,7 +609,7 @@ class _ModelWrapper:
 
             # Record start time
             start_time = time.perf_counter()
-            
+
             try:
                 response = wrapped(*args, **kwargs)
                 output_message = _parse_model_output(response)
@@ -585,20 +619,23 @@ class _ModelWrapper:
                 duration_ms = (end_time - start_time) * 1000
                 span.set_attribute(GEN_AI_CLIENT_OPERATION_DURATION, duration_ms)
 
-                # Extract token usage
+                # Extract token usage and set individual token count attributes
                 token_usage = _extract_token_usage(response)
                 if token_usage:
-                    span.set_attribute(GEN_AI_CLIENT_TOKEN_USAGE, safe_json_dumps(token_usage))
-                    
+                    span.set_attributes(dict(_get_llm_token_count_attributes(token_usage)))
+
                     # Calculate time per output token
-                    output_tokens = token_usage.get("completion_tokens") or token_usage.get("output_tokens")
+                    output_tokens = (
+                        token_usage.get("completion_tokens")
+                        or token_usage.get("output_tokens")
+                    )
                     time_per_token = _calculate_time_per_output_token(duration_ms, output_tokens)
                     if time_per_token is not None:
                         span.set_attribute(GEN_AI_CLIENT_TIME_PER_OUTPUT_TOKEN, time_per_token)
 
                 span.set_attributes(dict(_output_value_and_mime_type(output_message)))
                 return response
-            except Exception as e:
+            except Exception:
                 # Still record duration even on error
                 end_time = time.perf_counter()
                 duration_ms = (end_time - start_time) * 1000
@@ -647,7 +684,7 @@ class _ModelWrapper:
                     timing_collector.record_token()
                     responses.append(chunk)
                     yield chunk
-                
+
                 # Calculate final metrics
                 end_time = time.perf_counter()
                 duration_ms = (end_time - start_time) * 1000
@@ -663,21 +700,29 @@ class _ModelWrapper:
                     span.set_attribute(GEN_AI_CLIENT_TIME_BETWEEN_TOKEN, time_between_tokens)
 
                 # Try to extract token usage from the final response or model
+                # and set individual token count attributes
                 if responses:
                     last_response = responses[-1]
                     token_usage = _extract_token_usage(last_response)
                     if token_usage:
-                        span.set_attribute(GEN_AI_CLIENT_TOKEN_USAGE, safe_json_dumps(token_usage))
-                        
-                        # Calculate time per output token
-                        output_tokens = token_usage.get("completion_tokens") or token_usage.get("output_tokens") or timing_collector.token_count
-                        time_per_token = _calculate_time_per_output_token(duration_ms, output_tokens)
+                        span.set_attributes(dict(_get_llm_token_count_attributes(token_usage)))
+
+                        output_tokens = (
+                            token_usage.get("completion_tokens")
+                            or token_usage.get("output_tokens")
+                            or timing_collector.token_count
+                        )
+                        time_per_token = _calculate_time_per_output_token(
+                            duration_ms, output_tokens
+                        )
                         if time_per_token is not None:
                             span.set_attribute(GEN_AI_CLIENT_TIME_PER_OUTPUT_TOKEN, time_per_token)
 
-                output_message = json.dumps([_parse_model_output(response) for response in responses])
+                output_message = json.dumps(
+                    [_parse_model_output(response) for response in responses]
+                )
                 span.set_attributes(dict(_output_value_and_mime_type(output_message)))
-            except Exception as e:
+            except Exception:
                 # Still record duration even on error
                 end_time = time.perf_counter()
                 duration_ms = (end_time - start_time) * 1000
@@ -717,7 +762,7 @@ class _ModelWrapper:
 
             # Record start time
             start_time = time.perf_counter()
-            
+
             try:
                 response = await wrapped(*args, **kwargs)
                 output_message = _parse_model_output(response)
@@ -727,20 +772,23 @@ class _ModelWrapper:
                 duration_ms = (end_time - start_time) * 1000
                 span.set_attribute(GEN_AI_CLIENT_OPERATION_DURATION, duration_ms)
 
-                # Extract token usage
+                # Extract token usage and set individual token count attributes
                 token_usage = _extract_token_usage(response)
                 if token_usage:
-                    span.set_attribute(GEN_AI_CLIENT_TOKEN_USAGE, safe_json_dumps(token_usage))
-                    
+                    span.set_attributes(dict(_get_llm_token_count_attributes(token_usage)))
+
                     # Calculate time per output token
-                    output_tokens = token_usage.get("completion_tokens") or token_usage.get("output_tokens")
+                    output_tokens = (
+                        token_usage.get("completion_tokens")
+                        or token_usage.get("output_tokens")
+                    )
                     time_per_token = _calculate_time_per_output_token(duration_ms, output_tokens)
                     if time_per_token is not None:
                         span.set_attribute(GEN_AI_CLIENT_TIME_PER_OUTPUT_TOKEN, time_per_token)
 
                 span.set_attributes(dict(_output_value_and_mime_type(output_message)))
                 return response
-            except Exception as e:
+            except Exception:
                 # Still record duration even on error
                 end_time = time.perf_counter()
                 duration_ms = (end_time - start_time) * 1000
@@ -791,7 +839,7 @@ class _ModelWrapper:
                     timing_collector.record_token()
                     responses.append(chunk)
                     yield chunk
-                
+
                 # Calculate final metrics
                 end_time = time.perf_counter()
                 duration_ms = (end_time - start_time) * 1000
@@ -807,21 +855,29 @@ class _ModelWrapper:
                     span.set_attribute(GEN_AI_CLIENT_TIME_BETWEEN_TOKEN, time_between_tokens)
 
                 # Try to extract token usage from the final response or model
+                # and set individual token count attributes
                 if responses:
                     last_response = responses[-1]
                     token_usage = _extract_token_usage(last_response)
                     if token_usage:
-                        span.set_attribute(GEN_AI_CLIENT_TOKEN_USAGE, safe_json_dumps(token_usage))
-                        
-                        # Calculate time per output token
-                        output_tokens = token_usage.get("completion_tokens") or token_usage.get("output_tokens") or timing_collector.token_count
-                        time_per_token = _calculate_time_per_output_token(duration_ms, output_tokens)
+                        span.set_attributes(dict(_get_llm_token_count_attributes(token_usage)))
+
+                        output_tokens = (
+                            token_usage.get("completion_tokens")
+                            or token_usage.get("output_tokens")
+                            or timing_collector.token_count
+                        )
+                        time_per_token = _calculate_time_per_output_token(
+                            duration_ms, output_tokens
+                        )
                         if time_per_token is not None:
                             span.set_attribute(GEN_AI_CLIENT_TIME_PER_OUTPUT_TOKEN, time_per_token)
 
-                output_message = json.dumps([_parse_model_output(response) for response in responses])
+                output_message = json.dumps(
+                    [_parse_model_output(response) for response in responses]
+                )
                 span.set_attributes(dict(_output_value_and_mime_type(output_message)))
-            except Exception as e:
+            except Exception:
                 # Still record duration even on error
                 end_time = time.perf_counter()
                 duration_ms = (end_time - start_time) * 1000
@@ -974,7 +1030,6 @@ GEN_AI_CLIENT_OPERATION_DURATION = SpanAttributes.GEN_AI_CLIENT_OPERATION_DURATI
 GEN_AI_CLIENT_TIME_TO_FIRST_TOKEN = SpanAttributes.GEN_AI_CLIENT_TIME_TO_FIRST_TOKEN
 GEN_AI_CLIENT_TIME_BETWEEN_TOKEN = SpanAttributes.GEN_AI_CLIENT_TIME_BETWEEN_TOKEN
 GEN_AI_CLIENT_TIME_PER_OUTPUT_TOKEN = SpanAttributes.GEN_AI_CLIENT_TIME_PER_OUTPUT_TOKEN
-GEN_AI_CLIENT_TOKEN_USAGE = SpanAttributes.GEN_AI_CLIENT_TOKEN_USAGE
 OPENINFERENCE_SPAN_KIND = SpanAttributes.OPENINFERENCE_SPAN_KIND
 OUTPUT_MIME_TYPE = SpanAttributes.OUTPUT_MIME_TYPE
 OUTPUT_VALUE = SpanAttributes.OUTPUT_VALUE
