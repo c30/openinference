@@ -18,6 +18,7 @@ from typing import (
 
 from opentelemetry.util.types import AttributeValue
 
+from openinference.instrumentation import MetricsHelper
 from openinference.instrumentation.openai._attributes._responses_api import _ResponsesApiAttributes
 from openinference.instrumentation.openai._utils import _get_openai_version, _get_texts
 from openinference.semconv.trace import (
@@ -50,9 +51,10 @@ class _ResponseAttributesExtractor:
         "_completion_type",
         "_create_embedding_response_type",
         "_responses_type",
+        "_metrics_helper",
     )
 
-    def __init__(self, openai: ModuleType) -> None:
+    def __init__(self, openai: ModuleType, metrics_helper: Optional[MetricsHelper] = None) -> None:
         self._openai = openai
         self._chat_completion_type: Type["ChatCompletion"] = openai.types.chat.ChatCompletion
         self._completion_type: Type["Completion"] = openai.types.Completion
@@ -60,6 +62,7 @@ class _ResponseAttributesExtractor:
         self._create_embedding_response_type: Type["CreateEmbeddingResponse"] = (
             openai.types.CreateEmbeddingResponse
         )
+        self._metrics_helper = metrics_helper
 
     def get_attributes_from_response(
         self,
@@ -240,6 +243,20 @@ class _ResponseAttributesExtractor:
     ) -> Iterator[Tuple[str, AttributeValue]]:
         # openai.types.CompletionUsage
         # See https://github.com/openai/openai-python/blob/f1c7d714914e3321ca2e72839fe2d132a8646e7f/src/openai/types/completion_usage.py#L8  # noqa: E501
+        
+        # Emit metrics if metrics helper is available
+        if self._metrics_helper:
+            try:
+                if (total_tokens := getattr(usage, "total_tokens", None)) is not None:
+                    self._metrics_helper.record_token_count_total(total_tokens)
+                if (prompt_tokens := getattr(usage, "prompt_tokens", None)) is not None:
+                    self._metrics_helper.record_token_count_prompt(prompt_tokens)
+                if (completion_tokens := getattr(usage, "completion_tokens", None)) is not None:
+                    self._metrics_helper.record_token_count_completion(completion_tokens)
+            except Exception:
+                logger.exception("Failed to record token usage metrics")
+        
+        # Continue emitting span attributes as before
         if (total_tokens := getattr(usage, "total_tokens", None)) is not None:
             yield SpanAttributes.LLM_TOKEN_COUNT_TOTAL, total_tokens
         if (prompt_tokens := getattr(usage, "prompt_tokens", None)) is not None:
