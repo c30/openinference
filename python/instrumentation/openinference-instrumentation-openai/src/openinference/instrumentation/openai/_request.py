@@ -12,7 +12,7 @@ from opentelemetry.trace import INVALID_SPAN
 from opentelemetry.util.types import AttributeValue
 from typing_extensions import TypeAlias
 
-from openinference.instrumentation import get_attributes_from_context
+from openinference.instrumentation import get_attributes_from_context, MetricsHelper
 from openinference.instrumentation.openai._request_attributes_extractor import (
     _RequestAttributesExtractor,
 )
@@ -93,14 +93,16 @@ class _WithOpenAI(ABC):
         "_request_attributes_extractor",
         "_response_attributes_extractor",
         "_response_accumulator_factories",
+        "_metrics_helper",
     )
 
-    def __init__(self, openai: ModuleType, *args: Any, **kwargs: Any) -> None:
+    def __init__(self, openai: ModuleType, metrics_helper: MetricsHelper = None, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self._openai = openai
+        self._metrics_helper = metrics_helper
         self._stream_types = (openai.Stream, openai.AsyncStream)
         self._request_attributes_extractor = _RequestAttributesExtractor(openai=openai)
-        self._response_attributes_extractor = _ResponseAttributesExtractor(openai=openai)
+        self._response_attributes_extractor = _ResponseAttributesExtractor(openai=openai, metrics_helper=metrics_helper)
 
         def responses_accumulator(request_parameters: _RequestParameters) -> Any:
             return _ResponsesAccumulator(

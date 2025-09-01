@@ -6,7 +6,7 @@ from opentelemetry import trace as trace_api
 from opentelemetry.instrumentation.instrumentor import BaseInstrumentor  # type: ignore
 from wrapt import wrap_function_wrapper
 
-from openinference.instrumentation import OITracer, TraceConfig
+from openinference.instrumentation import MetricsHelper, OITracer, TraceConfig
 from openinference.instrumentation.openai._request import (
     _AsyncRequest,
     _Request,
@@ -44,18 +44,22 @@ class OpenAIInstrumentor(BaseInstrumentor):  # type: ignore
             trace_api.get_tracer(__name__, __version__, tracer_provider),
             config=config,
         )
+        metrics_helper = MetricsHelper(
+            meter_name=__name__,
+            version=__version__
+        )
         openai = import_module(_MODULE)
         self._original_request = openai.OpenAI.request
         self._original_async_request = openai.AsyncOpenAI.request
         wrap_function_wrapper(
             module=_MODULE,
             name="OpenAI.request",
-            wrapper=_Request(tracer=tracer, openai=openai),
+            wrapper=_Request(tracer=tracer, openai=openai, metrics_helper=metrics_helper),
         )
         wrap_function_wrapper(
             module=_MODULE,
             name="AsyncOpenAI.request",
-            wrapper=_AsyncRequest(tracer=tracer, openai=openai),
+            wrapper=_AsyncRequest(tracer=tracer, openai=openai, metrics_helper=metrics_helper),
         )
 
     def _uninstrument(self, **kwargs: Any) -> None:
