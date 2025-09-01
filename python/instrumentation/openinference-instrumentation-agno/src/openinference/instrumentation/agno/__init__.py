@@ -1,5 +1,6 @@
 from typing import Any, Callable, Collection, List, Optional, Type
 
+from opentelemetry import metrics as metrics_api
 from opentelemetry import trace as trace_api
 from opentelemetry.instrumentation.instrumentor import BaseInstrumentor  # type: ignore
 from wrapt import wrap_function_wrapper
@@ -80,6 +81,11 @@ class AgnoInstrumentor(BaseInstrumentor):  # type: ignore
         "_original_function_aexecute_method",
         "_original_model_call_methods",
         "_tracer",
+        "_meter",
+        "_duration_histogram",
+        "_time_to_first_token_histogram", 
+        "_time_per_output_token_histogram",
+        "_time_between_tokens_histogram",
     )
 
     def instrumentation_dependencies(self) -> Collection[str]:
@@ -100,6 +106,41 @@ class AgnoInstrumentor(BaseInstrumentor):  # type: ignore
             trace_api.get_tracer(__name__, __version__, tracer_provider),
             config=config,
         )
+
+        # Set up metrics instrumentation
+        if not (meter_provider := kwargs.get("meter_provider")):
+            meter_provider = metrics_api.get_meter_provider()
+        self._meter = metrics_api.get_meter(__name__, __version__, meter_provider)
+        
+        # Create histogram instruments for timing metrics
+        self._duration_histogram = self._meter.create_histogram(
+            name="gen_ai.client.operation.duration",
+            unit="ms",
+            description="Duration of AI model operations"
+        )
+        self._time_to_first_token_histogram = self._meter.create_histogram(
+            name="gen_ai.client.time_to_first_token",
+            unit="ms",
+            description="Time to first token in streaming AI model operations"
+        )
+        self._time_per_output_token_histogram = self._meter.create_histogram(
+            name="gen_ai.client.time_per_output_token", 
+            unit="ms",
+            description="Average time per output token"
+        )
+        self._time_between_tokens_histogram = self._meter.create_histogram(
+            name="gen_ai.client.time_between_tokens",
+            unit="ms", 
+            description="Average time between tokens in streaming operations"
+        )
+
+        # Create wrapper instances with metrics support
+        metrics = {
+            "duration_histogram": self._duration_histogram,
+            "time_to_first_token_histogram": self._time_to_first_token_histogram,
+            "time_per_output_token_histogram": self._time_per_output_token_histogram,
+            "time_between_tokens_histogram": self._time_between_tokens_histogram,
+        }
 
         run_wrapper = _RunWrapper(tracer=self._tracer)
         self._original_run_method = getattr(Agent, "_run", None)
@@ -159,7 +200,7 @@ class AgnoInstrumentor(BaseInstrumentor):  # type: ignore
         agno_model_subclasses = find_model_subclasses()
         # Instrument all model subclasses
         for model_subclass in agno_model_subclasses:
-            model_wrapper = _ModelWrapper(tracer=self._tracer)
+            model_wrapper = _ModelWrapper(tracer=self._tracer, metrics=metrics)
             self._original_model_call_methods[model_subclass] = {
                 "invoke": model_subclass.invoke,
                 "ainvoke": model_subclass.ainvoke,
