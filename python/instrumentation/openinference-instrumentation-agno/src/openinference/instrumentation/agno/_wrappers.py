@@ -539,8 +539,9 @@ class _StreamTimingCollector:
 
 
 class _ModelWrapper:
-    def __init__(self, tracer: trace_api.Tracer) -> None:
+    def __init__(self, tracer: trace_api.Tracer, metrics: Optional[Dict[str, Any]] = None) -> None:
         self._tracer = tracer
+        self._metrics = metrics or {}
 
     def run(
         self,
@@ -585,6 +586,17 @@ class _ModelWrapper:
                 duration_ms = (end_time - start_time) * 1000
                 span.set_attribute(GEN_AI_CLIENT_OPERATION_DURATION, duration_ms)
 
+                # Record duration to histogram
+                if duration_histogram := self._metrics.get("duration_histogram"):
+                    duration_histogram.record(
+                        duration_ms, 
+                        attributes={
+                            "operation": "invoke",
+                            "model": model.id,
+                            "provider": model.provider,
+                        }
+                    )
+
                 # Extract token usage
                 token_usage = _extract_token_usage(response)
                 if token_usage:
@@ -595,6 +607,17 @@ class _ModelWrapper:
                     time_per_token = _calculate_time_per_output_token(duration_ms, output_tokens)
                     if time_per_token is not None:
                         span.set_attribute(GEN_AI_CLIENT_TIME_PER_OUTPUT_TOKEN, time_per_token)
+                        
+                        # Record time per output token to histogram
+                        if time_per_token_histogram := self._metrics.get("time_per_output_token_histogram"):
+                            time_per_token_histogram.record(
+                                time_per_token,
+                                attributes={
+                                    "operation": "invoke",
+                                    "model": model.id,
+                                    "provider": model.provider,
+                                }
+                            )
 
                 span.set_attributes(dict(_output_value_and_mime_type(output_message)))
                 return response
@@ -603,6 +626,18 @@ class _ModelWrapper:
                 end_time = time.perf_counter()
                 duration_ms = (end_time - start_time) * 1000
                 span.set_attribute(GEN_AI_CLIENT_OPERATION_DURATION, duration_ms)
+                
+                # Record duration to histogram even on error
+                if duration_histogram := self._metrics.get("duration_histogram"):
+                    duration_histogram.record(
+                        duration_ms,
+                        attributes={
+                            "operation": "invoke",
+                            "model": model.id,
+                            "provider": model.provider,
+                            "error": "true",
+                        }
+                    )
                 raise
 
     def run_stream(
@@ -727,6 +762,17 @@ class _ModelWrapper:
                 duration_ms = (end_time - start_time) * 1000
                 span.set_attribute(GEN_AI_CLIENT_OPERATION_DURATION, duration_ms)
 
+                # Record duration to histogram
+                if duration_histogram := self._metrics.get("duration_histogram"):
+                    duration_histogram.record(
+                        duration_ms, 
+                        attributes={
+                            "operation": "ainvoke",
+                            "model": model.id,
+                            "provider": model.provider,
+                        }
+                    )
+
                 # Extract token usage
                 token_usage = _extract_token_usage(response)
                 if token_usage:
@@ -737,6 +783,17 @@ class _ModelWrapper:
                     time_per_token = _calculate_time_per_output_token(duration_ms, output_tokens)
                     if time_per_token is not None:
                         span.set_attribute(GEN_AI_CLIENT_TIME_PER_OUTPUT_TOKEN, time_per_token)
+                        
+                        # Record time per output token to histogram
+                        if time_per_token_histogram := self._metrics.get("time_per_output_token_histogram"):
+                            time_per_token_histogram.record(
+                                time_per_token,
+                                attributes={
+                                    "operation": "ainvoke",
+                                    "model": model.id,
+                                    "provider": model.provider,
+                                }
+                            )
 
                 span.set_attributes(dict(_output_value_and_mime_type(output_message)))
                 return response
@@ -745,6 +802,18 @@ class _ModelWrapper:
                 end_time = time.perf_counter()
                 duration_ms = (end_time - start_time) * 1000
                 span.set_attribute(GEN_AI_CLIENT_OPERATION_DURATION, duration_ms)
+                
+                # Record duration to histogram even on error
+                if duration_histogram := self._metrics.get("duration_histogram"):
+                    duration_histogram.record(
+                        duration_ms,
+                        attributes={
+                            "operation": "ainvoke",
+                            "model": model.id,
+                            "provider": model.provider,
+                            "error": "true",
+                        }
+                    )
                 raise
 
     async def arun_stream(
