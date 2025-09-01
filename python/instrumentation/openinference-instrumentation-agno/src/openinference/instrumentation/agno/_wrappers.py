@@ -493,6 +493,30 @@ def _extract_token_usage(response: Any) -> Optional[Dict[str, Any]]:
         return None
 
 
+def _get_llm_token_count_attributes(token_usage: Optional[Dict[str, Any]]) -> Iterator[Tuple[str, Any]]:
+    """Extract individual token count attributes from usage data following semantic conventions."""
+    if not token_usage:
+        return
+    
+    # Handle prompt tokens (input tokens)
+    prompt_tokens = token_usage.get("prompt_tokens") or token_usage.get("input_tokens")
+    if prompt_tokens is not None:
+        yield LLM_TOKEN_COUNT_PROMPT, prompt_tokens
+    
+    # Handle completion tokens (output tokens)
+    completion_tokens = token_usage.get("completion_tokens") or token_usage.get("output_tokens")
+    if completion_tokens is not None:
+        yield LLM_TOKEN_COUNT_COMPLETION, completion_tokens
+    
+    # Handle total tokens
+    total_tokens = token_usage.get("total_tokens")
+    if total_tokens is not None:
+        yield LLM_TOKEN_COUNT_TOTAL, total_tokens
+    elif prompt_tokens is not None and completion_tokens is not None:
+        # Calculate total if not provided but components are available
+        yield LLM_TOKEN_COUNT_TOTAL, prompt_tokens + completion_tokens
+
+
 def _calculate_time_per_output_token(duration_ms: float, output_tokens: Optional[int]) -> Optional[float]:
     """Calculate average time per output token in milliseconds."""
     if output_tokens and output_tokens > 0:
@@ -585,10 +609,10 @@ class _ModelWrapper:
                 duration_ms = (end_time - start_time) * 1000
                 span.set_attribute(GEN_AI_CLIENT_OPERATION_DURATION, duration_ms)
 
-                # Extract token usage
+                # Extract token usage and set individual token count attributes
                 token_usage = _extract_token_usage(response)
                 if token_usage:
-                    span.set_attribute(GEN_AI_CLIENT_TOKEN_USAGE, safe_json_dumps(token_usage))
+                    span.set_attributes(dict(_get_llm_token_count_attributes(token_usage)))
                     
                     # Calculate time per output token
                     output_tokens = token_usage.get("completion_tokens") or token_usage.get("output_tokens")
@@ -662,12 +686,12 @@ class _ModelWrapper:
                 if time_between_tokens is not None:
                     span.set_attribute(GEN_AI_CLIENT_TIME_BETWEEN_TOKEN, time_between_tokens)
 
-                # Try to extract token usage from the final response or model
+                # Try to extract token usage from the final response or model and set individual token count attributes
                 if responses:
                     last_response = responses[-1]
                     token_usage = _extract_token_usage(last_response)
                     if token_usage:
-                        span.set_attribute(GEN_AI_CLIENT_TOKEN_USAGE, safe_json_dumps(token_usage))
+                        span.set_attributes(dict(_get_llm_token_count_attributes(token_usage)))
                         
                         # Calculate time per output token
                         output_tokens = token_usage.get("completion_tokens") or token_usage.get("output_tokens") or timing_collector.token_count
@@ -727,10 +751,10 @@ class _ModelWrapper:
                 duration_ms = (end_time - start_time) * 1000
                 span.set_attribute(GEN_AI_CLIENT_OPERATION_DURATION, duration_ms)
 
-                # Extract token usage
+                # Extract token usage and set individual token count attributes
                 token_usage = _extract_token_usage(response)
                 if token_usage:
-                    span.set_attribute(GEN_AI_CLIENT_TOKEN_USAGE, safe_json_dumps(token_usage))
+                    span.set_attributes(dict(_get_llm_token_count_attributes(token_usage)))
                     
                     # Calculate time per output token
                     output_tokens = token_usage.get("completion_tokens") or token_usage.get("output_tokens")
@@ -806,12 +830,12 @@ class _ModelWrapper:
                 if time_between_tokens is not None:
                     span.set_attribute(GEN_AI_CLIENT_TIME_BETWEEN_TOKEN, time_between_tokens)
 
-                # Try to extract token usage from the final response or model
+                # Try to extract token usage from the final response or model and set individual token count attributes
                 if responses:
                     last_response = responses[-1]
                     token_usage = _extract_token_usage(last_response)
                     if token_usage:
-                        span.set_attribute(GEN_AI_CLIENT_TOKEN_USAGE, safe_json_dumps(token_usage))
+                        span.set_attributes(dict(_get_llm_token_count_attributes(token_usage)))
                         
                         # Calculate time per output token
                         output_tokens = token_usage.get("completion_tokens") or token_usage.get("output_tokens") or timing_collector.token_count
@@ -974,7 +998,6 @@ GEN_AI_CLIENT_OPERATION_DURATION = SpanAttributes.GEN_AI_CLIENT_OPERATION_DURATI
 GEN_AI_CLIENT_TIME_TO_FIRST_TOKEN = SpanAttributes.GEN_AI_CLIENT_TIME_TO_FIRST_TOKEN
 GEN_AI_CLIENT_TIME_BETWEEN_TOKEN = SpanAttributes.GEN_AI_CLIENT_TIME_BETWEEN_TOKEN
 GEN_AI_CLIENT_TIME_PER_OUTPUT_TOKEN = SpanAttributes.GEN_AI_CLIENT_TIME_PER_OUTPUT_TOKEN
-GEN_AI_CLIENT_TOKEN_USAGE = SpanAttributes.GEN_AI_CLIENT_TOKEN_USAGE
 OPENINFERENCE_SPAN_KIND = SpanAttributes.OPENINFERENCE_SPAN_KIND
 OUTPUT_MIME_TYPE = SpanAttributes.OUTPUT_MIME_TYPE
 OUTPUT_VALUE = SpanAttributes.OUTPUT_VALUE
